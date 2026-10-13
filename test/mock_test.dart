@@ -21,6 +21,8 @@ const methodChannel = MethodChannel('polar/methods');
 const eventChannel = EventChannel('polar/events');
 const searchChannel = EventChannel('polar/search');
 
+final eventHandler = EventHandler();
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -28,7 +30,7 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(methodChannel, handleMethodCall);
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockStreamHandler(eventChannel, EventHandler());
+        .setMockStreamHandler(eventChannel, eventHandler);
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockStreamHandler(searchChannel, SearchHandler());
   });
@@ -137,6 +139,7 @@ Future<dynamic> handleMethodCall(MethodCall call) async {
       automaticReconnection = call.arguments as bool;
       return null;
     case 'disconnectFromDevice':
+      eventHandler.emitDisconnected();
       return null;
     case 'isFeatureReady':
       final arguments = call.arguments as List<Object?>;
@@ -204,43 +207,66 @@ Future<dynamic> handleMethodCall(MethodCall call) async {
       return null;
     case 'isFtuDone':
       return true;
+    case 'shutDown':
+      return null;
     default:
       throw UnimplementedError();
   }
 }
 
 class EventHandler extends MockStreamHandler {
+  MockStreamHandlerEventSink? _sink;
+
   @override
   void onListen(dynamic arguments, MockStreamHandlerEventSink events) {
-    events.success({'event': 'deviceConnecting', 'data': info});
-    events.success({'event': 'deviceConnected', 'data': info});
-    events.success({
+    _sink = events;
+  }
+
+  @override
+  void onCancel(dynamic arguments) {
+    _sink = null;
+  }
+
+  void emitConnecting() {
+    _sink?.success({'event': 'deviceConnecting', 'data': info});
+  }
+
+  void emitConnected() {
+    _sink?.success({'event': 'deviceConnected', 'data': info});
+    _sink?.success({
       'event': 'disInformationReceived',
       'data': [identifier, '', ''],
     });
-    events.success({
+    _sink?.success({
       'event': 'batteryLevelReceived',
       'data': [identifier, 100],
     });
-    events.success({
+    _sink?.success({
       'event': 'batteryChargingStatusReceived',
       'data': [identifier, PolarChargeState.dischargingActive.toJson()],
     });
     for (final feature in PolarSdkFeature.values) {
-      events.success({
+      _sink?.success({
         'event': 'sdkFeatureReady',
         'data': [identifier, feature.toJson()],
       });
     }
+    _sink?.success({
+      'event': 'sdkFeaturesReadiness',
+      'data': [
+        identifier,
+        PolarSdkFeature.values.map((e) => e.toJson()).toList(),
+        <String>[],
+      ],
+    });
+  }
 
-    events.success({
+  void emitDisconnected() {
+    _sink?.success({
       'event': 'deviceDisconnected',
       'data': [info, false],
     });
   }
-
-  @override
-  void onCancel(dynamic arguments) {}
 }
 
 class SearchHandler extends MockStreamHandler {

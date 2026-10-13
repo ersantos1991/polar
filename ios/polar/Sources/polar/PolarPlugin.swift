@@ -169,6 +169,9 @@ public class PolarPlugin:
 
     do {
       switch call.method {
+      case "shutDown":
+        shutDown()
+        result(nil)
       case "connectToDevice":
         try api.connectToDevice(call.arguments as! String)
         result(nil)
@@ -614,6 +617,18 @@ public class PolarPlugin:
     success(
       "sdkFeatureReady",
       data: [identifier, String(describing: feature)])
+  }
+
+  public func bleSdkFeaturesReadiness(
+    _ identifier: String, ready: [PolarBleSdkFeature], unavailable: [PolarBleSdkFeature]
+  ) {
+    success(
+      "sdkFeaturesReadiness",
+      data: [
+        identifier,
+        ready.map { String(describing: $0) },
+        unavailable.map { String(describing: $0) },
+      ])
   }
 
   public func disInformationReceived(_ identifier: String, uuid: CBUUID, value: String) {

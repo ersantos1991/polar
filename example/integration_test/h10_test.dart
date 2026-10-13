@@ -5,7 +5,7 @@ import 'package:polar/polar.dart';
 
 import '../../test/tests.dart';
 
-const identifier = '1C709B20';
+const identifier = 'D780C525';
 
 void main() async {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -21,10 +21,11 @@ void main() async {
       PolarSdkFeature.sdkMode,
       PolarSdkFeature.ledAnimation,
       PolarSdkFeature.activityData,
-      if (Platform.isIOS) PolarSdkFeature.fileTransfer,
       PolarSdkFeature.hts,
       PolarSdkFeature.sleepData,
       PolarSdkFeature.temperatureData,
+      if (Platform.isIOS) PolarSdkFeature.offlineExerciseV2,
+      if (Platform.isAndroid) PolarSdkFeature.trainingData,
     }),
   );
   testHrService(identifier);
@@ -38,4 +39,5 @@ void main() async {
   );
   testRecording(identifier);
   testMisc(identifier, supportsLedConfig: false);
+  testShutDown(identifier);
 }

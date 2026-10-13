@@ -75,10 +75,13 @@ object DateSerializer : JsonDeserializer<Date>, JsonSerializer<Date> {
     }
 
     override fun serialize(
-        src: Date?,
+        src: LocalDateTime?,
         typeOfSrc: Type?,
         context: JsonSerializationContext?,
-    ): JsonElement = JsonPrimitive(src?.time)
+    ): JsonElement =
+        JsonPrimitive(
+            src?.toInstant(ZoneOffset.UTC)?.toEpochMilli() ?: 0,
+        )
 }
 
 object LocalDateSerializer : JsonDeserializer<LocalDate>, JsonSerializer<LocalDate> {
