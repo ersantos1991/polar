@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.KotlinProjectExtension
+import com.android.build.gradle.LibraryExtension
 
 allprojects {
     repositories {
@@ -12,7 +13,10 @@ subprojects {
     afterEvaluate {
         def kotlinExt = extensions.findByType(KotlinProjectExtension)
         if (kotlinExt != null) {
-            kotlinExt.jvmToolchain(21)
+            kotlinExt.jvmToolchain(17)
+        }
+        if (project.name == "reactive_ble_mobile") {
+            extensions.getByType(LibraryExtension).compileSdk = 36
         }
     }
 

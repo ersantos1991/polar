@@ -70,7 +70,7 @@ class PolarFirstTimeUseConfig {
   final FtuGender gender;
 
   /// The user's birth date
-  @UnixTimeConverter()
+  @FtuBirthDateConverter()
   final DateTime birthDate;
 
   /// The user's height in centimeters (90-240)
@@ -93,6 +93,7 @@ class PolarFirstTimeUseConfig {
   final FtuTrainingBackground trainingBackground;
 
   /// The device time in ISO 8601 format
+  @IsoDateTimeConverter()
   final DateTime deviceTime;
 
   /// The user's typical daily activity level

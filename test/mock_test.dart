@@ -1,8 +1,8 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:meta/meta.dart';
 import 'package:polar/polar.dart';
 
 import 'tests.dart';
@@ -45,19 +45,103 @@ void main() {
   testSdkMode(identifier);
   testMisc(identifier, supportsLedConfig: true);
   testFtu(identifier);
+
+  test('feature names match both native platforms', () {
+    for (final feature in PolarSdkFeature.values) {
+      final androidName = feature.toJson(TargetPlatform.android);
+      expect(PolarSdkFeature.fromJson(androidName), feature);
+
+      if (feature == PolarSdkFeature.companionDeviceManagement) {
+        expect(
+          () => feature.toJson(TargetPlatform.iOS),
+          throwsUnsupportedError,
+        );
+      } else {
+        final iosName = feature.toJson(TargetPlatform.iOS);
+        expect(PolarSdkFeature.fromJson(iosName), feature);
+      }
+    }
+
+    expect(
+      PolarSdkFeature.telemetry.toJson(TargetPlatform.android),
+      'FEATURE_TELEMETRY',
+    );
+    expect(
+      PolarSdkFeature.telemetry.toJson(TargetPlatform.iOS),
+      'feature_telemetry_data_streaming',
+    );
+  });
+
+  test(
+    'connection and device control methods use distinct native calls',
+    () async {
+      factoryResetRequested = false;
+      restartRequested = false;
+      await polar.setAutomaticReconnection(false);
+      expect(automaticReconnection, false);
+      await polar.waitForConnection(identifier, requestPermissions: false);
+      expect(
+        await polar.isFeatureReady(identifier, PolarSdkFeature.deviceControl),
+        true,
+      );
+
+      await polar.doRestart(identifier);
+      expect(restartRequested, true);
+      expect(factoryResetRequested, false);
+    },
+  );
+
+  test('connectToDevice propagates immediate native errors', () async {
+    connectError = PlatformException(
+      code: 'invalid_identifier',
+      message: 'Invalid device identifier',
+    );
+    addTearDown(() => connectError = null);
+
+    await expectLater(
+      polar.connectToDevice(identifier, requestPermissions: false),
+      throwsA(isA<PlatformException>()),
+    );
+  });
+
+  test('factory reset can explicitly remove pairing information', () async {
+    factoryResetRequested = false;
+    preservePairingInformation = null;
+
+    await polar.doFactoryReset(identifier, false);
+
+    expect(factoryResetRequested, true);
+    expect(preservePairingInformation, false);
+  });
 }
 
 final exercises = <PolarExerciseEntry>[];
 var recording = false;
 var exerciseId = '';
 var sdkModeEnabled = false;
+var automaticReconnection = true;
+var factoryResetRequested = false;
+var restartRequested = false;
+bool? preservePairingInformation;
+PlatformException? connectError;
 
 Future<dynamic> handleMethodCall(MethodCall call) async {
   switch (call.method) {
     case 'connectToDevice':
+      final error = connectError;
+      if (error != null) throw error;
+      return null;
+    case 'waitForConnection':
+      return null;
+    case 'setAutomaticReconnection':
+      automaticReconnection = call.arguments as bool;
       return null;
     case 'disconnectFromDevice':
       return null;
+    case 'isFeatureReady':
+      final arguments = call.arguments as List<Object?>;
+      return PolarSdkFeature.fromJson(arguments[1]) !=
+          PolarSdkFeature.companionDeviceManagement;
     case 'getAvailableOnlineStreamDataTypes':
       return jsonEncode(PolarDataType.values.map((e) => e.toJson()).toList());
     case 'requestStreamSettings':
@@ -106,8 +190,17 @@ Future<dynamic> handleMethodCall(MethodCall call) async {
     case 'isSdkModeEnabled':
       return sdkModeEnabled;
     case 'doFactoryReset':
+      factoryResetRequested = true;
+      preservePairingInformation = (call.arguments as List<Object?>)[1] as bool;
+      return null;
+    case 'doRestart':
+      restartRequested = true;
       return null;
     case 'doFirstTimeUse':
+      final payload =
+          jsonDecode(call.arguments[1] as String) as Map<String, dynamic>;
+      expect(payload['birthDate'], {'year': 1990, 'month': 1, 'day': 1});
+      expect(payload['deviceTime'], isA<String>());
       return null;
     case 'isFtuDone':
       return true;

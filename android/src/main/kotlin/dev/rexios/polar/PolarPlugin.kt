@@ -3,7 +3,7 @@ package dev.rexios.polar
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import androidx.lifecycle.Lifecycle.Event
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonDeserializationContext
@@ -40,19 +40,39 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
-import io.reactivex.rxjava3.disposables.Disposable
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.launch
 import java.lang.reflect.Type
+import java.time.Instant
+import java.time.LocalDate
+import java.util.Collections
 import java.util.Date
 import java.util.UUID
-
-fun Any?.discard() = Unit
 
 object DateSerializer : JsonDeserializer<Date>, JsonSerializer<Date> {
     override fun deserialize(
         json: JsonElement?,
         typeOfT: Type?,
         context: JsonDeserializationContext?,
-    ): Date = Date(json?.asJsonPrimitive?.asLong ?: 0)
+    ): Date {
+        if (json == null || json.isJsonNull) {
+            return Date(0)
+        }
+
+        val primitive = json.asJsonPrimitive
+        return when {
+            primitive.isNumber -> Date(primitive.asLong)
+            primitive.isString -> Date.from(Instant.parse(primitive.asString))
+            else -> throw IllegalArgumentException("Unsupported date payload: $json")
+        }
+    }
 
     override fun serialize(
         src: Date?,
@@ -61,11 +81,60 @@ object DateSerializer : JsonDeserializer<Date>, JsonSerializer<Date> {
     ): JsonElement = JsonPrimitive(src?.time)
 }
 
+object LocalDateSerializer : JsonDeserializer<LocalDate>, JsonSerializer<LocalDate> {
+    override fun deserialize(
+        json: JsonElement?,
+        typeOfT: Type?,
+        context: JsonDeserializationContext?,
+    ): LocalDate {
+        if (json == null || json.isJsonNull) {
+            throw IllegalArgumentException("LocalDate payload was null")
+        }
+
+        if (json.isJsonPrimitive) {
+            return LocalDate.parse(json.asString)
+        }
+
+        val obj = json.asJsonObject
+        val year =
+            obj.get("year")?.asInt
+                ?: obj.get("yearValue")?.asInt
+                ?: throw IllegalArgumentException("Missing year in LocalDate payload: $json")
+        val month =
+            obj.get("month")?.asInt
+                ?: obj.get("monthValue")?.asInt
+                ?: throw IllegalArgumentException("Missing month in LocalDate payload: $json")
+        val day =
+            obj.get("day")?.asInt
+                ?: obj.get("dayOfMonth")?.asInt
+                ?: throw IllegalArgumentException("Missing day in LocalDate payload: $json")
+
+        return LocalDate.of(year, month, day)
+    }
+
+    override fun serialize(
+        src: LocalDate?,
+        typeOfSrc: Type?,
+        context: JsonSerializationContext?,
+    ): JsonElement {
+        val value = src ?: return JsonPrimitive(null as String?)
+        val obj = com.google.gson.JsonObject()
+        obj.addProperty("year", value.year)
+        obj.addProperty("month", value.monthValue)
+        obj.addProperty("day", value.dayOfMonth)
+        return obj
+    }
+}
+
 private fun runOnUiThread(runnable: () -> Unit) {
     Handler(Looper.getMainLooper()).post { runnable() }
 }
 
-private val gson = GsonBuilder().registerTypeAdapter(Date::class.java, DateSerializer).create()
+private val gson =
+    GsonBuilder()
+        .registerTypeAdapter(Date::class.java, DateSerializer)
+        .registerTypeAdapter(LocalDate::class.java, LocalDateSerializer)
+        .create()
 
 private var wrapperInternal: PolarWrapper? = null
 private val wrapper: PolarWrapper
@@ -95,7 +164,23 @@ class PolarPlugin :
     // Streaming channels
     private val streamingChannels = mutableMapOf<String, StreamingChannel>()
 
+    private var attachedToEngine = false
+    private var operationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val operationJobs = Collections.synchronizedSet(mutableSetOf<Job>())
+    private val sinkIds = mutableSetOf<Int>()
+    private var activityLifecycle: Lifecycle? = null
+    private val lifecycleObserver =
+        LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                wrapperInternal?.api?.foregroundEntered()
+            }
+        }
+
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
+        attachedToEngine = true
+        if (!operationScope.coroutineContext[Job]!!.isActive) {
+            operationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        }
         messenger = flutterPluginBinding.binaryMessenger
 
         methodChannel = MethodChannel(flutterPluginBinding.binaryMessenger, "polar/methods")
@@ -111,10 +196,16 @@ class PolarPlugin :
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        attachedToEngine = false
+        operationScope.cancel()
         methodChannel.setMethodCallHandler(null)
         eventChannel.setStreamHandler(null)
         searchChannel.setStreamHandler(null)
         streamingChannels.values.forEach { it.dispose() }
+        streamingChannels.clear()
+        sinkIds.forEach { wrapperInternal?.removeSink(it) }
+        sinkIds.clear()
+        detachLifecycle()
         shutDown()
     }
 
@@ -124,94 +215,146 @@ class PolarPlugin :
         }
     }
 
+    private fun launchOperation(
+        result: Result,
+        operation: suspend () -> Any?,
+    ) {
+        lateinit var job: Job
+        job =
+            operationScope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    val value = operation()
+                    completeResult { result.success(value) }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Throwable) {
+                    completeResult { result.error(error.toString(), error.message, null) }
+                } finally {
+                    operationJobs.remove(job)
+                }
+            }
+        operationJobs.add(job)
+        job.start()
+    }
+
+    private fun completeResult(completion: () -> Unit) {
+        if (!attachedToEngine) return
+        runOnUiThread {
+            if (attachedToEngine) {
+                completion()
+            }
+        }
+    }
+
     override fun onMethodCall(
         call: MethodCall,
         result: Result,
     ) {
         initApi()
 
-        when (call.method) {
-            "connectToDevice" -> {
-                wrapper.api.connectToDevice(call.arguments as String)
-                result.success(null)
-            }
+        try {
+            when (call.method) {
+                "connectToDevice" -> {
+                    wrapper.api.connectToDevice(call.arguments as String)
+                    result.success(null)
+                }
+                "waitForConnection" -> {
+                    launchOperation(result) {
+                        wrapper.api.waitForConnection(call.arguments as String)
+                        null
+                    }
+                }
+                "setAutomaticReconnection" -> {
+                    wrapper.api.setAutomaticReconnection(call.arguments as Boolean)
+                    result.success(null)
+                }
+                "disconnectFromDevice" -> {
+                    wrapper.api.disconnectFromDevice(call.arguments as String)
+                    result.success(null)
+                }
 
-            "disconnectFromDevice" -> {
-                wrapper.api.disconnectFromDevice(call.arguments as String)
-                result.success(null)
-            }
+                "getAvailableOnlineStreamDataTypes" -> {
+                    getAvailableOnlineStreamDataTypes(call, result)
+                }
 
-            "getAvailableOnlineStreamDataTypes" -> {
-                getAvailableOnlineStreamDataTypes(call, result)
-            }
+                "getAvailableHrServiceDataTypes" -> {
+                    getAvailableHrServiceDataTypes(call, result)
+                }
 
-            "getAvailableHrServiceDataTypes" -> {
-                getAvailableHrServiceDataTypes(call, result)
-            }
+                "requestStreamSettings" -> {
+                    requestStreamSettings(call, result)
+                }
 
-            "requestStreamSettings" -> {
-                requestStreamSettings(call, result)
-            }
+                "createStreamingChannel" -> {
+                    createStreamingChannel(call, result)
+                }
 
-            "createStreamingChannel" -> {
-                createStreamingChannel(call, result)
-            }
+                "startRecording" -> {
+                    startRecording(call, result)
+                }
 
-            "startRecording" -> {
-                startRecording(call, result)
-            }
+                "stopRecording" -> {
+                    stopRecording(call, result)
+                }
 
-            "stopRecording" -> {
-                stopRecording(call, result)
-            }
+                "requestRecordingStatus" -> {
+                    requestRecordingStatus(call, result)
+                }
 
-            "requestRecordingStatus" -> {
-                requestRecordingStatus(call, result)
-            }
+                "listExercises" -> {
+                    listExercises(call, result)
+                }
 
-            "listExercises" -> {
-                listExercises(call, result)
-            }
+                "fetchExercise" -> {
+                    fetchExercise(call, result)
+                }
 
-            "fetchExercise" -> {
-                fetchExercise(call, result)
-            }
+                "removeExercise" -> {
+                    removeExercise(call, result)
+                }
 
-            "removeExercise" -> {
-                removeExercise(call, result)
-            }
+                "setLedConfig" -> {
+                    setLedConfig(call, result)
+                }
 
-            "setLedConfig" -> {
-                setLedConfig(call, result)
-            }
+                "doFactoryReset" -> {
+                    doFactoryReset(call, result)
+                }
 
-            "doFactoryReset" -> {
-                doFactoryReset(call, result)
-            }
+                "doRestart" -> {
+                    doRestart(call, result)
+                }
 
-            "enableSdkMode" -> {
-                enableSdkMode(call, result)
-            }
+                "isFeatureReady" -> {
+                    isFeatureReady(call, result)
+                }
 
-            "disableSdkMode" -> {
-                disableSdkMode(call, result)
-            }
+                "enableSdkMode" -> {
+                    enableSdkMode(call, result)
+                }
 
-            "isSdkModeEnabled" -> {
-                isSdkModeEnabled(call, result)
-            }
+                "disableSdkMode" -> {
+                    disableSdkMode(call, result)
+                }
 
-            "doFirstTimeUse" -> {
-                doFirstTimeUse(call, result)
-            }
+                "isSdkModeEnabled" -> {
+                    isSdkModeEnabled(call, result)
+                }
 
-            "isFtuDone" -> {
-                isFtuDone(call, result)
-            }
+                "doFirstTimeUse" -> {
+                    doFirstTimeUse(call, result)
+                }
 
-            else -> {
-                result.notImplemented()
+                "isFtuDone" -> {
+                    isFtuDone(call, result)
+                }
+
+                else -> {
+                    result.notImplemented()
+                }
             }
+        } catch (error: Throwable) {
+            result.error(error.toString(), error.message, null)
         }
     }
 
@@ -220,38 +363,45 @@ class PolarPlugin :
         events: EventSink,
     ) {
         initApi()
-        wrapper.addSink(arguments as Int, events)
+        val id = arguments as Int
+        sinkIds.add(id)
+        wrapper.addSink(id, events)
     }
 
     override fun onCancel(arguments: Any?) {
         val id = arguments as? Int ?: return
+        sinkIds.remove(id)
         wrapper.removeSink(id)
     }
 
     private val searchHandler =
         object : EventChannel.StreamHandler {
-            private var searchSubscription: Disposable? = null
+            private var searchJob: Job? = null
 
             override fun onListen(
                 arguments: Any?,
                 events: EventSink,
             ) {
                 initApi()
-
-                searchSubscription =
-                    wrapper.api.searchForDevice().subscribe({
-                        runOnUiThread { events.success(gson.toJson(it)) }
-                    }, {
-                        runOnUiThread {
-                            events.error(it.toString(), it.message, null)
+                searchJob?.cancel()
+                searchJob =
+                    operationScope.launch {
+                        try {
+                            wrapper.api.searchForDevice().collect {
+                                completeResult { events.success(gson.toJson(it)) }
+                            }
+                            completeResult { events.endOfStream() }
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Throwable) {
+                            completeResult { events.error(error.toString(), error.message, null) }
                         }
-                    }, {
-                        runOnUiThread { events.endOfStream() }
-                    })
+                    }
             }
 
             override fun onCancel(arguments: Any?) {
-                searchSubscription?.dispose()
+                searchJob?.cancel()
+                searchJob = null
             }
         }
 
@@ -273,33 +423,37 @@ class PolarPlugin :
     }
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
-        val lifecycle = FlutterLifecycleAdapter.getActivityLifecycle(binding)
-        lifecycle.addObserver(
-            LifecycleEventObserver { _, event ->
-                when (event) {
-                    Event.ON_RESUME -> {
-                        wrapperInternal?.api?.foregroundEntered()
-                    }
-
-                    Event.ON_DESTROY -> {
-                        shutDown()
-                    }
-
-                    else -> {}
-                }
-            },
-        )
+        attachLifecycle(binding)
     }
 
-    override fun onDetachedFromActivityForConfigChanges() {}
+    override fun onDetachedFromActivityForConfigChanges() {
+        detachLifecycle()
+    }
 
-    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {}
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        attachLifecycle(binding)
+    }
 
-    override fun onDetachedFromActivity() {}
+    override fun onDetachedFromActivity() {
+        detachLifecycle()
+    }
+
+    private fun attachLifecycle(binding: ActivityPluginBinding) {
+        detachLifecycle()
+        activityLifecycle = FlutterLifecycleAdapter.getActivityLifecycle(binding)
+        activityLifecycle?.addObserver(lifecycleObserver)
+    }
+
+    private fun detachLifecycle() {
+        activityLifecycle?.removeObserver(lifecycleObserver)
+        activityLifecycle = null
+    }
 
     private fun shutDown() {
-        if (wrapperInternal == null) return
-        wrapper.shutDown()
+        val currentWrapper = wrapperInternal ?: return
+        if (currentWrapper.shutDown()) {
+            wrapperInternal = null
+        }
     }
 
     private fun getAvailableOnlineStreamDataTypes(
@@ -307,17 +461,14 @@ class PolarPlugin :
         result: Result,
     ) {
         val identifier = call.arguments as String
-
-        wrapper.api
-            .getAvailableOnlineStreamDataTypes(identifier)
-            .subscribe({
-                runOnUiThread { result.success(gson.toJson(it)) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            val dataTypes =
+                wrapper.api
+                    .getAvailableOnlineStreamDataTypes(identifier)
+                    .filterNot { it == PolarDeviceDataType.DERIVED_MEASUREMENT }
+                    .toSet()
+            gson.toJson(dataTypes)
+        }
     }
 
     private fun getAvailableHrServiceDataTypes(
@@ -325,17 +476,14 @@ class PolarPlugin :
         result: Result,
     ) {
         val identifier = call.arguments as String
-
-        wrapper.api
-            .getAvailableHRServiceDataTypes(identifier)
-            .subscribe({
-                runOnUiThread { result.success(gson.toJson(it)) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            val dataTypes =
+                wrapper.api
+                    .getAvailableHRServiceDataTypes(identifier)
+                    .filterNot { it == PolarDeviceDataType.DERIVED_MEASUREMENT }
+                    .toSet()
+            gson.toJson(dataTypes)
+        }
     }
 
     private fun requestStreamSettings(
@@ -346,16 +494,9 @@ class PolarPlugin :
         val identifier = arguments[0] as String
         val feature = gson.fromJson(arguments[1] as String, PolarDeviceDataType::class.java)
 
-        wrapper.api
-            .requestStreamSettings(identifier, feature)
-            .subscribe({
-                runOnUiThread { result.success(gson.toJson(it)) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            gson.toJson(wrapper.api.requestStreamSettings(identifier, feature))
+        }
     }
 
     private fun startRecording(
@@ -368,16 +509,10 @@ class PolarPlugin :
         val interval = gson.fromJson(arguments[2] as String, RecordingInterval::class.java)
         val sampleType = gson.fromJson(arguments[3] as String, SampleType::class.java)
 
-        wrapper.api
-            .startRecording(identifier, exerciseId, interval, sampleType)
-            .subscribe({
-                runOnUiThread { result.success(null) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            wrapper.api.startRecording(identifier, exerciseId, interval, sampleType)
+            null
+        }
     }
 
     private fun stopRecording(
@@ -386,16 +521,10 @@ class PolarPlugin :
     ) {
         val identifier = call.arguments as String
 
-        wrapper.api
-            .stopRecording(identifier)
-            .subscribe({
-                runOnUiThread { result.success(null) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            wrapper.api.stopRecording(identifier)
+            null
+        }
     }
 
     private fun requestRecordingStatus(
@@ -404,16 +533,10 @@ class PolarPlugin :
     ) {
         val identifier = call.arguments as String
 
-        wrapper.api
-            .requestRecordingStatus(identifier)
-            .subscribe({
-                runOnUiThread { result.success(listOf(it.first, it.second)) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            val status = wrapper.api.requestRecordingStatus(identifier)
+            listOf(status.ongoing, status.entryId)
+        }
     }
 
     private fun listExercises(
@@ -422,19 +545,13 @@ class PolarPlugin :
     ) {
         val identifier = call.arguments as String
 
-        val exercises = mutableListOf<String>()
-        wrapper.api
-            .listExercises(identifier)
-            .subscribe({
+        launchOperation(result) {
+            val exercises = mutableListOf<String>()
+            wrapper.api.listExercises(identifier).collect {
                 exercises.add(gson.toJson(it))
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            }, {
-                result.success(exercises)
-            })
-            .discard()
+            }
+            exercises
+        }
     }
 
     private fun fetchExercise(
@@ -445,16 +562,9 @@ class PolarPlugin :
         val identifier = arguments[0] as String
         val entry = gson.fromJson(arguments[1] as String, PolarExerciseEntry::class.java)
 
-        wrapper.api
-            .fetchExercise(identifier, entry)
-            .subscribe({
-                result.success(gson.toJson(it))
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            gson.toJson(wrapper.api.fetchExercise(identifier, entry))
+        }
     }
 
     private fun removeExercise(
@@ -465,16 +575,10 @@ class PolarPlugin :
         val identifier = arguments[0] as String
         val entry = gson.fromJson(arguments[1] as String, PolarExerciseEntry::class.java)
 
-        wrapper.api
-            .removeExercise(identifier, entry)
-            .subscribe({
-                runOnUiThread { result.success(null) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            wrapper.api.removeExercise(identifier, entry)
+            null
+        }
     }
 
     private fun setLedConfig(
@@ -485,16 +589,10 @@ class PolarPlugin :
         val identifier = arguments[0] as String
         val config = gson.fromJson(arguments[1] as String, LedConfig::class.java)
 
-        wrapper.api
-            .setLedConfig(identifier, config)
-            .subscribe({
-                runOnUiThread { result.success(null) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            wrapper.api.setLedConfig(identifier, config)
+            null
+        }
     }
 
     private fun doFactoryReset(
@@ -505,16 +603,32 @@ class PolarPlugin :
         val identifier = arguments[0] as String
         val preservePairingInformation = arguments[1] as Boolean
 
-        wrapper.api
-            .doFactoryReset(identifier, preservePairingInformation)
-            .subscribe({
-                runOnUiThread { result.success(null) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            @Suppress("DEPRECATION")
+            wrapper.api.doFactoryReset(identifier, preservePairingInformation)
+            null
+        }
+    }
+
+    private fun doRestart(
+        call: MethodCall,
+        result: Result,
+    ) {
+        val identifier = call.arguments as String
+        launchOperation(result) {
+            wrapper.api.doRestart(identifier)
+            null
+        }
+    }
+
+    private fun isFeatureReady(
+        call: MethodCall,
+        result: Result,
+    ) {
+        val arguments = call.arguments as List<*>
+        val identifier = arguments[0] as String
+        val feature = PolarBleSdkFeature.valueOf(arguments[1] as String)
+        result.success(wrapper.api.isFeatureReady(identifier, feature))
     }
 
     private fun enableSdkMode(
@@ -522,16 +636,10 @@ class PolarPlugin :
         result: Result,
     ) {
         val identifier = call.arguments as String
-        wrapper.api
-            .enableSDKMode(identifier)
-            .subscribe({
-                runOnUiThread { result.success(null) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            wrapper.api.enableSDKMode(identifier)
+            null
+        }
     }
 
     private fun disableSdkMode(
@@ -539,16 +647,10 @@ class PolarPlugin :
         result: Result,
     ) {
         val identifier = call.arguments as String
-        wrapper.api
-            .disableSDKMode(identifier)
-            .subscribe({
-                runOnUiThread { result.success(null) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            wrapper.api.disableSDKMode(identifier)
+            null
+        }
     }
 
     private fun isSdkModeEnabled(
@@ -556,16 +658,9 @@ class PolarPlugin :
         result: Result,
     ) {
         val identifier = call.arguments as String
-        wrapper.api
-            .isSDKModeEnabled(identifier)
-            .subscribe({
-                runOnUiThread { result.success(it) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            wrapper.api.isSDKModeEnabled(identifier)
+        }
     }
 
     private fun doFirstTimeUse(
@@ -576,16 +671,10 @@ class PolarPlugin :
         val identifier = arguments[0] as String
         val ftuConfig = gson.fromJson(arguments[1] as String, PolarFirstTimeUseConfig::class.java)
 
-        wrapper.api
-            .doFirstTimeUse(identifier, ftuConfig)
-            .subscribe({
-                runOnUiThread { result.success(null) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            wrapper.api.doFirstTimeUse(identifier, ftuConfig)
+            null
+        }
     }
 
     private fun isFtuDone(
@@ -594,16 +683,9 @@ class PolarPlugin :
     ) {
         val identifier = call.arguments as String
 
-        wrapper.api
-            .isFtuDone(identifier)
-            .subscribe({ isFtuDone ->
-                runOnUiThread { result.success(isFtuDone) }
-            }, {
-                runOnUiThread {
-                    result.error(it.toString(), it.message, null)
-                }
-            })
-            .discard()
+        launchOperation(result) {
+            wrapper.api.isFtuDone(identifier)
+        }
     }
 }
 
@@ -616,6 +698,8 @@ class PolarWrapper(
         ),
     private val sinks: MutableMap<Int, EventSink> = mutableMapOf(),
 ) : PolarBleApiCallbackProvider {
+    private var isShutdown = false
+
     init {
         api.setApiCallback(this)
     }
@@ -638,14 +722,14 @@ class PolarWrapper(
         runOnUiThread { sinks.values.forEach { it.success(mapOf("event" to event, "data" to data)) } }
     }
 
-    fun shutDown() {
+    fun shutDown(): Boolean {
         // Do not shutdown the api if other engines are still using it
-        if (sinks.isNotEmpty()) return
-        try {
+        if (sinks.isNotEmpty()) return false
+        if (!isShutdown) {
             api.shutDown()
-        } catch (e: Exception) {
-            // This will throw if the API is already shut down
+            isShutdown = true
         }
+        return true
     }
 
     override fun blePowerStateChanged(powered: Boolean) {
@@ -657,6 +741,14 @@ class PolarWrapper(
         feature: PolarBleSdkFeature,
     ) {
         success("sdkFeatureReady", listOf(identifier, feature.name))
+    }
+
+    override fun bleSdkFeaturesReadiness(
+        identifier: String,
+        ready: List<PolarBleSdkFeature>,
+        unavailable: List<PolarBleSdkFeature>,
+    ) {
+        // Individual ready features are exposed through bleSdkFeatureReady.
     }
 
     override fun deviceConnected(polarDeviceInfo: PolarDeviceInfo) {
@@ -716,7 +808,7 @@ class PolarWrapper(
         identifier: String,
         powerSourcesState: PowerSourcesState,
     ) {
-        TODO("Not yet implemented")
+        // The Dart API does not currently expose this callback.
     }
 
     @Deprecated("", replaceWith = ReplaceWith(""))
@@ -736,7 +828,8 @@ class StreamingChannel(
     private val feature: PolarDeviceDataType,
     private val channel: EventChannel = EventChannel(messenger, name),
 ) : EventChannel.StreamHandler {
-    private var subscription: Disposable? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var streamingJob: Job? = null
 
     init {
         channel.setStreamHandler(this)
@@ -746,10 +839,12 @@ class StreamingChannel(
         arguments: Any?,
         events: EventSink,
     ) {
+        streamingJob?.cancel()
+
         // Will be null for some features
         val settings = gson.fromJson(arguments as String, PolarSensorSetting::class.java)
 
-        val stream =
+        val stream: Flow<*> =
             when (feature) {
                 PolarDeviceDataType.HR -> {
                     api.startHrStreaming(identifier)
@@ -800,26 +895,53 @@ class StreamingChannel(
                 PolarDeviceDataType.LOCATION -> {
                     api.startLocationStreaming(identifier, settings)
                 }
+
+                PolarDeviceDataType.DERIVED_MEASUREMENT -> {
+                    events.error(
+                        "Unsupported Polar data type",
+                        "DERIVED_MEASUREMENT is not exposed by the Dart API",
+                        null,
+                    )
+                    return
+                }
             }
 
-        subscription =
-            stream.subscribe({
-                runOnUiThread { events.success(gson.toJson(it)) }
-            }, {
-                runOnUiThread {
-                    events.error(it.toString(), it.message, null)
+        streamingJob =
+            scope.launch {
+                try {
+                    stream.collect {
+                        runOnUiThread {
+                            if (streamingJob?.isActive == true) {
+                                events.success(gson.toJson(it))
+                            }
+                        }
+                    }
+                    runOnUiThread {
+                        if (streamingJob?.isActive == true) {
+                            events.endOfStream()
+                        }
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Throwable) {
+                    runOnUiThread {
+                        if (streamingJob?.isActive == true) {
+                            events.error(error.toString(), error.message, null)
+                        }
+                    }
                 }
-            }, {
-                runOnUiThread { events.endOfStream() }
-            })
+            }
     }
 
     override fun onCancel(arguments: Any?) {
-        subscription?.dispose()
+        streamingJob?.cancel()
+        streamingJob = null
     }
 
     fun dispose() {
-        subscription?.dispose()
+        streamingJob?.cancel()
+        streamingJob = null
+        scope.cancel()
         channel.setStreamHandler(null)
     }
 }

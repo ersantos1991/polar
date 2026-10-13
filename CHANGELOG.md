@@ -1,3 +1,25 @@
+## Unreleased
+
+- Upgrades Polar BLE SDK to `8.4.0`
+- Raises the Android minimum SDK version from 24 to 26
+- Migrates the Android bridge from RxJava to coroutines and Flow
+- Migrates the iOS bridge from RxSwift to Swift Concurrency
+- Adds `waitForConnection`, `isFeatureReady`, and non-destructive `doRestart`
+- Propagates immediate `connectToDevice` errors without treating acceptance as
+  connection confirmation
+- Cancels native operations and streams when their channels or plugin lifecycle
+  end
+- Adds explicit cross-platform `PolarSdkFeature` serialization
+- Replaces the fixed-device example with BLE discovery, device selection, Polar
+  SDK connection state, and repeatable connect/disconnect controls
+- Adds an explicit, optional Polar 360 restart action without using factory reset
+- Expands the example into a functional test bench for streams, H10 recording,
+  exercises, SDK mode, LED configuration, FTU, device information, and errors
+- Persists the selected device identifier and requests a fresh SDK connection
+  when the example is reopened
+- Adds a confirmed Polar 360 factory-reset action that removes pairing
+  information so the device can be configured by another phone
+
 ## 7.10.0
 
 - Upgrades Polar SDK to `6.14.0`

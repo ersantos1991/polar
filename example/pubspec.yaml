@@ -3,15 +3,17 @@ description: Demonstrates how to use the polar plugin.
 publish_to: none
 
 environment:
-  sdk: ">=2.17.0 <3.0.0"
+  sdk: ^3.9.2
 
 dependencies:
   flutter:
     sdk: flutter
 
+  flutter_reactive_ble: 5.5.0
   polar:
     path: ../
 
+  shared_preferences: ^2.5.3
   uuid: ^4.0.0
 
 dev_dependencies:
@@ -20,7 +22,10 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
-  rexios_lints: ^17.0.0
+  rexios_lints: ^16.0.0
+
+dependency_overrides:
+  reactive_ble_mobile: 5.5.0
 
 flutter:
   uses-material-design: true

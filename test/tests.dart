@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:polar/polar.dart';
@@ -24,31 +22,36 @@ void testSearch(String identifier) {
 
 void testConnection(String identifier) {
   test('connection', () async {
+    final connectingEvent = polar.deviceConnecting.first;
+    final connectedEvent = polar.deviceConnected.first;
     await polar.connectToDevice(identifier);
 
-    final connecting = await polar.deviceConnecting.first;
+    final connecting = await connectingEvent;
     expect(connecting.deviceId, identifier);
 
-    final connected = await polar.deviceConnected.first;
+    final connected = await connectedEvent;
     expect(connected.deviceId, identifier);
 
+    final disconnectedEvent = polar.deviceDisconnected.first;
     await polar.disconnectFromDevice(identifier);
 
-    final disconnected = await polar.deviceDisconnected.first;
+    final disconnected = await disconnectedEvent;
     expect(disconnected.info.deviceId, identifier);
   });
 }
 
 /// Ensure device connects
 Future<void> connect(String identifier) async {
+  final connectedEvent = polar.deviceConnected.first;
   await polar.connectToDevice(identifier);
-  await polar.deviceConnected.first;
+  await connectedEvent;
 }
 
 /// Ensure device disconnects
 Future<void> disconnect(String identifier) async {
+  final disconnectedEvent = polar.deviceDisconnected.first;
   await polar.disconnectFromDevice(identifier);
-  await polar.deviceDisconnected.first;
+  await disconnectedEvent;
 }
 
 void testBasicData(
@@ -86,12 +89,11 @@ void testBleSdkFeatures(
   required Set<PolarSdkFeature> features,
 }) {
   test('Ble sdk features', () async {
-    await connect(identifier);
-
     final available = <PolarSdkFeature>{};
     final sub = polar.sdkFeatureReady.listen((e) => available.add(e.feature));
+    await connect(identifier);
     await Future.delayed(const Duration(seconds: 3));
-    unawaited(sub.cancel());
+    await sub.cancel();
 
     expect(setEquals(available, features), true);
     await disconnect(identifier);

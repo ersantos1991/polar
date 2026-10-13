@@ -100,6 +100,67 @@ class UnixTimeConverter extends JsonConverter<DateTime, int> {
   int toJson(DateTime object) => object.millisecondsSinceEpoch;
 }
 
+/// Converter for FTU birth dates.
+///
+/// iOS expects unix milliseconds while Android expects a local date object.
+class FtuBirthDateConverter extends JsonConverter<DateTime, Object> {
+  /// Constructor
+  const FtuBirthDateConverter();
+
+  @override
+  DateTime fromJson(Object json) {
+    if (json is int) {
+      return DateTime.fromMillisecondsSinceEpoch(json);
+    }
+
+    if (json is Map) {
+      final year = json['year'] as int?;
+      final month = json['month'] as int?;
+      final day = json['day'] as int?;
+
+      if (year == null || month == null || day == null) {
+        throw const FormatException('Invalid FTU birthDate payload');
+      }
+
+      return DateTime(year, month, day);
+    }
+
+    throw FormatException('Unsupported FTU birthDate payload: $json');
+  }
+
+  @override
+  Object toJson(DateTime object) {
+    if (Platform.isIOS) {
+      return object.millisecondsSinceEpoch;
+    }
+
+    return <String, int>{
+      'year': object.year,
+      'month': object.month,
+      'day': object.day,
+    };
+  }
+}
+
+/// Converter for FTU device time.
+///
+/// Both platforms accept ISO 8601 strings when the native bridge parses them.
+class IsoDateTimeConverter extends JsonConverter<DateTime, String> {
+  /// Constructor
+  const IsoDateTimeConverter();
+
+  @override
+  DateTime fromJson(String json) => DateTime.parse(json);
+
+  @override
+  String toJson(DateTime object) {
+    final iso = object.toUtc().toIso8601String();
+    // Polar SDK parses deviceTime at second precision only; strip sub-seconds.
+    final dot = iso.indexOf('.');
+    return dot != -1 ? '${iso.substring(0, dot)}Z' : iso;
+  }
+}
+
 /// Converter for [PolarSettingType]
 class PolarSettingTypeConverter
     extends JsonConverter<PolarSettingType, String> {

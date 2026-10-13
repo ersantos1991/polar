@@ -131,7 +131,26 @@ class Polar {
       await this.requestPermissions();
     }
 
-    unawaited(_methodChannel.invokeMethod('connectToDevice', identifier));
+    await _methodChannel.invokeMethod('connectToDevice', identifier);
+  }
+
+  /// Enable or disable automatic reconnection in the native Polar SDK.
+  Future<void> setAutomaticReconnection(bool value) {
+    return _methodChannel.invokeMethod('setAutomaticReconnection', value);
+  }
+
+  /// Wait until the SDK-managed session is connected.
+  ///
+  /// This does not initiate a connection and the Polar SDK does not apply a
+  /// timeout to this operation.
+  Future<void> waitForConnection(
+    String identifier, {
+    bool requestPermissions = true,
+  }) async {
+    if (requestPermissions) {
+      await this.requestPermissions();
+    }
+    await _methodChannel.invokeMethod('waitForConnection', identifier);
   }
 
   /// Request the necessary permissions on Android
@@ -215,11 +234,52 @@ class Polar {
     String identifier,
     PolarDataType feature,
   ) async {
-    final response = await _methodChannel.invokeMethod(
-      'requestStreamSettings',
-      [identifier, feature.toJson()],
+    const maxRetries = 3;
+    var attempt = 0;
+
+    while (true) {
+      try {
+        final response = await _methodChannel.invokeMethod(
+          'requestStreamSettings',
+          [identifier, feature.toJson()],
+        );
+        return PolarSensorSetting.fromJson(jsonDecode(response));
+      } on PlatformException catch (error) {
+        final shouldRetry =
+            attempt < maxRetries && _isInvalidStateStreamSettingsError(error);
+        if (!shouldRetry) rethrow;
+
+        // PMD can briefly report invalid state right after connect/feature ready.
+        await Future<void>.delayed(Duration(milliseconds: 250 * (attempt + 1)));
+        attempt++;
+      }
+    }
+  }
+
+  bool _isInvalidStateStreamSettingsError(PlatformException error) {
+    final code = error.code.toUpperCase();
+    final message = (error.message ?? '').toUpperCase();
+    return code.contains('ERROR_INVALID_STATE') ||
+        message.contains('ERROR_INVALID_STATE') ||
+        code.contains('BLECONTROLPOINTCOMMANDERROR') ||
+        message.contains('BLECONTROLPOINTCOMMANDERROR');
+  }
+
+  Map<String, dynamic> _decodeStreamingEvent(dynamic event) {
+    if (event is String) {
+      final decoded = jsonDecode(event);
+      if (decoded is Map) {
+        return decoded.cast<String, dynamic>();
+      }
+    }
+
+    if (event is Map) {
+      return event.cast<String, dynamic>();
+    }
+
+    throw FormatException(
+      'Unexpected streaming payload type: ${event.runtimeType}',
     );
-    return PolarSensorSetting.fromJson(jsonDecode(response));
   }
 
   Stream<Map<String, dynamic>> _startStreaming(
@@ -245,11 +305,9 @@ class Polar {
       settings = availableSettings.maxSettings();
     }
 
-    yield* EventChannel(channelName)
-        .receiveBroadcastStream(jsonEncode(settings))
-        .cast<String>()
-        .map(jsonDecode)
-        .cast<Map<String, dynamic>>();
+    yield* EventChannel(
+      channelName,
+    ).receiveBroadcastStream(jsonEncode(settings)).map(_decodeStreamingEvent);
   }
 
   /// Start heart rate stream. Heart rate stream is stopped if the connection is closed,
@@ -592,6 +650,29 @@ class Polar {
       identifier,
       preservePairingInformation,
     ]);
+  }
+
+  /// Restart the device without restoring factory defaults.
+  ///
+  /// Completion means that the restart command was accepted or caused the
+  /// expected disconnection. It does not mean that the device is ready again.
+  Future<void> doRestart(String identifier) {
+    return _methodChannel.invokeMethod('doRestart', identifier);
+  }
+
+  /// Check whether an SDK feature is ready for the current session.
+  Future<bool> isFeatureReady(
+    String identifier,
+    PolarSdkFeature feature,
+  ) async {
+    final result = await _methodChannel.invokeMethod<bool>('isFeatureReady', [
+      identifier,
+      feature.toJson(),
+    ]);
+    if (result == null) {
+      throw StateError('isFeatureReady returned null');
+    }
+    return result;
   }
 
   ///  Enables SDK mode.
